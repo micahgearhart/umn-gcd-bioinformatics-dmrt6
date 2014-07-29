@@ -1,0 +1,703 @@
+DMRT6 Integrative Analysis
+========================================================
+```{r set-options, echo=FALSE, cache=FALSE}
+options(width=60)
+```
+
+Process raw data using STAR, FASTQC, PICARD, SAMTOOLS and  IGVTOOLS  (Minnesota Supercomputing Institute)
+```{r eval=FALSE}
+dd=/home/zarkowe0/data_release/umgc/hiseq/131125_SN261_0527_AC3540ACXX/Project_Zarkower_Project_013
+wd=/home/bardwell/gearhart/dmrt6/
+org=mm9
+
+for i in 1663_1_DM6_WT_ATCACG 1663_3_DM6_WT_TTAGGC \
+1663_5_DM6_Null_ACAGTG 1663_2_DM6_Null_CGATGT 1663_4_DM6_WT_TGACCA 1665_2_DM6_Null_GCCAAT
+
+#i="${file%.*}"
+
+do
+
+sf1="${i}_L005_R1_001.fastq"
+sf2="${i}_L005_R2_001.fastq"
+
+cat << EOF > $i.star.pbs
+#PBS -l mem=32000mb,nodes=1:ppn=4,walltime=10:00:00 
+#PBS -m a
+#PBS -M gearh006@umn.edu 
+#PBS -q lab 
+mkdir $wd/$i
+cd $wd/$i
+/home/bardwell/shared/STAR_2.3.0e/STAR --genomeDir /home/bardwell/shared/STAR_GENOME/$org/ \
+--runThreadN 8 --readFilesIn $dd/$sf1 $dd/$sf2
+
+qsub $wd/$i.igv.pbs
+
+EOF
+
+cat << EOF > $i.igv.pbs
+#PBS -l mem=8000mb,nodes=1:ppn=1,walltime=08:00:00 
+#PBS -m a
+#PBS -M gearh006@umn.edu 
+#PBS -q lab 
+module load samtools
+
+cd $wd
+
+/home/bardwell/shared/FastQC/fastqc -o fastqc $dd/$sf1 
+/home/bardwell/shared/FastQC/fastqc -o fastqc $dd/$sf2 
+
+cd $wd/$i
+#convert sam to bam
+samtools view -bS -o $i.raw.bam Aligned.out.sam 
+
+#sort the bam file
+samtools sort $i.raw.bam $i.sort
+
+#remove duplicates
+java -Xmx2g -jar /home/bardwell/shared/picard-tools-1.94/MarkDuplicates.jar INPUT=$i.sort.bam OUTPUT=$i.bam REMOVE_DUPLICATES=true ASSUME_SORTED=true METRICS_FILE=$i.metrics MAX_FILE_HANDLES_FOR_READ_ENDS_MAP=1000 VALIDATION_STRINGENCY=LENIENT 
+
+#create the index file
+samtools index $i.bam
+
+#igvtools to make a TDF File
+java -Xmx2g  -jar /home/bardwell/shared/IGVTools_2/igvtools.jar count -z 5 -w 25 -e 100 $i.bam $i.tdf \
+/home/bardwell/shared/IGVTools_2/genomes/$org.genome
+
+rm $i.sort.bam
+rm $i.raw.bam
+
+mv $i.bam $wd/
+mv $i.bam.bai $wd/
+mv $i.tdf $wd/
+EOF
+
+qsub $i.star.pbs
+
+done
+```
+
+
+Analyse Reads for differential expression with EdgeR  (RNA-SEQ mm9 version)
+```{r libraries}
+library(Rsamtools)
+library(GenomicFeatures)
+library(GenomicRanges)
+library(GenomicAlignments)
+library(edgeR)
+library(qvalue)
+
+#For transcriptDB and annotations
+library(biomaRt)
+
+#For Pubmed Lookups
+library(XML)
+
+#For microarray
+library(GEOquery)
+library(Biobase)
+
+#For Chip Analysis
+library(rtracklayer)
+library(ChIPpeakAnno)
+data(TSS.mouse.NCBIM37)
+library(org.Mm.eg.db)
+library(GOstats)
+library("GO.db")
+
+#For Motif Analysis
+library(BSgenome.Mmusculus.UCSC.mm9)
+library(rGADEM)
+library(motifStack)
+```
+
+This section uses a package called biomaRt to download data from Ensembl.  We will get a list of all the Ensembl genes in the genome
+and some annotation information for these genes.  Since our data is mapped to mm9 we will use the May 2012 archive of Ensembl (their current release 
+is based on mm10).   Ensembl chromosomes are numbered 1-19,X,Y whereas our bam files are references as chr1-chr19,chrX,chrY so we have to do a quick 
+swtich of the chromosome names to use Ensembl genes on USCS mapped data.
+```{r eval=FALSE}
+#use may2012 archive to get mm9 NCBIM37 build (Ensembl Release 67)
+ensembl=useMart(host='may2012.archive.ensembl.org',
+                biomart="ENSEMBL_MART_ENSEMBL",
+                dataset="mmusculus_gene_ensembl")
+#ensembl=useMart(biomart="ensembl",dataset="mmusculus_gene_ensembl")
+mme <- makeTranscriptDbFromBiomart(host='may2012.archive.ensembl.org',
+                                   biomart="ENSEMBL_MART_ENSEMBL",
+                                   dataset="mmusculus_gene_ensembl")
+exonsByGene <- exonsBy(mme, by="gene")
+chroms<-seqlevels(mme)
+chroms[1:21]
+
+#oldSeqLevelsToKeep
+oldSeqLevelsToKeep<-as.character(chroms[1:21])
+str(oldSeqLevelsToKeep)
+oldSeqLevelsToKeep
+
+#Create a named character vector to use hg19 chromosome names
+chromRename <- paste("chr",as.character(chroms[1:21]),sep="")
+names(chromRename) <- as.character(chroms[1:21])
+str(chromRename)
+chromRename
+
+exonsByGene[1000:1000]
+exonsByGene <- keepSeqlevels(exonsByGene,oldSeqLevelsToKeep) 
+exonsByGene[1000: 1000]
+exonsByGene <- renameSeqlevels(exonsByGene,chromRename)
+exonsByGene[1000:1000]
+
+save(exonsByGene,file="exonsByGene_mm9_biomart_ensembl.rdata")
+```
+
+This chunck counts all the reads in the data.  Can take a long time so better to do it on the server.
+```{r eval=FALSE}
+#PBS -l mem=32gb,nodes=1:ppn=1,walltime=2:00:00 
+#PBS -m a
+#PBS -M gearh006@umn.edu 
+#PBS -q lab 
+
+cd /home/bardwell/gearhart/dmrt6/
+
+cat << EOF > summarizeOverlaps.r 
+
+library(Rsamtools)
+load("exonsByGene_mm9_biomart_ensembl.rdata")
+
+fls <- list.files("/home/bardwell/gearhart/dmrt6", pattern="bam$",full=TRUE)
+bamlst <- BamFileList(fls)
+genehits <- summarizeOverlaps(exonsByGene, bamlst, mode="Union",
+                              singleEnd=TRUE, ignore.strand=TRUE)
+save(genehits,file= "120313_DMRT6_counts_mm9_biomart_chrRN_ensembl.rdata")
+quit(save="no")
+
+EOF
+
+/panfs/roc/groups/10/bardwell/shared/R/R-3.0.1/bin/R --no-save < summarizeOverlaps.r
+```
+
+Once this is done, you can just reload in the counts whch are saved in the genehits variable in this file. This section removes all the genes that are not expressed (Total Reads across all samples < 10)
+```{r readFilterData}
+load("/mnt/afp/teng/data/120313_DMRT6_counts_mm9_biomart_chrRN_ensembl.rdata")
+str(genehits)
+temp=assays(genehits)$counts
+colnames(temp)
+colnames(temp) <- c("WT_R1","Null_R1","WT_R2","WT_R3","Null_R2","Null_R3")
+
+big10=apply(temp,1,sum)>10
+TotalReads=temp[big10,]
+nrow(TotalReads)
+colnames(TotalReads)
+```
+
+We will also use biomaRt to get annotations for all the mouse Ensembl genes.  Namely we want EntrezIDs and MGI data and positions in the genome.
+```{r ensemblMouse}
+ensembl=useMart(host='may2012.archive.ensembl.org',
+                biomart="ENSEMBL_MART_ENSEMBL",
+                dataset="mmusculus_gene_ensembl")
+#filters = listFilters(ensembl)
+#filters[1:100,]
+#attributes = listAttributes(ensembl)
+#attributes[1:100,]
+
+myattributes<-c("ensembl_gene_id","mgi_id","mgi_symbol",
+                "chromosome_name","start_position",
+                "end_position","strand","entrezgene")
+#test on a few genes
+annot=getBM(attributes=myattributes,filters="ensembl_gene_id",
+            values=c("ENSMUSG00000040363","ENSMUSG00000017652"),
+            mart=ensembl)
+head(annot)
+```
+
+Define a function to Extract Mouse Gene Names from Human Entrez IDs which we need for parsing Incomplete Ingenuity Data 
+```{r ensemblHuman}
+ensemblHuman=useMart(biomart="ensembl",dataset="hsapiens_gene_ensembl")
+#filtersHuman = listFilters(ensemblHuman)
+#filtersHuman[grep("Entrez",filtersHuman[,2]),]
+#filtersHuman[grep("with_homolog",filtersHuman[,1]),]
+#filtersHuman[1:10,]
+#attributesHuman = listAttributes(ensemblHuman)
+#attributesHuman[grep("homolog_ensembl_gene",attributes[,1]),]
+myattributesHuman<-c("ensembl_gene_id","mmusculus_homolog_ensembl_gene")
+getBM(attributes=myattributesHuman,
+      filters=c("entrezgene","with_homolog_mmus"),
+      values=list(c("54880"),TRUE),
+      mart=ensemblHuman)
+
+#Define a Function to do this on-the-fly below
+humanEntrezToMouseEnsemble <- function (xyz) {
+getBM(attributes=myattributesHuman,
+      filters=c("entrezgene","with_homolog_mmus"),
+      values=list(xyz,TRUE),mart=ensemblHuman)
+}
+```
+
+Create an annotation matrix for genes in Total Reads
+```{r Annotate}
+annot<-getBM(attributes=myattributes,
+             filters="ensembl_gene_id",
+             values=rownames(TotalReads),mart=ensembl)
+annot<-annot[!duplicated(annot[,"ensembl_gene_id"]),]
+rownames(annot)<-annot[,"ensembl_gene_id"]
+new_annot <- as.data.frame(TotalReads)
+new_annot$ensembl_gene_id <- rownames(new_annot)
+#annotation has to be in teh same order as TotalReads
+new_annot<-merge(new_annot,annot)
+rownames(new_annot)<-rownames(TotalReads)
+str(new_annot)
+```
+
+Create a function that will take a list of gene symbols and a query term and then return the number of publications in Pubmed and a URL to those publications.
+```{r pubmedBatch Query}
+pubmedBatchQuery <- function(temp,qt) {
+  output=data.frame()
+  for(i in 1:length(temp)) {
+  #query=paste0(temp[i,"mgi_symbol"]," AND ",qt)
+  query=paste0(temp[i]," AND ",qt)
+  query=gsub('\\s+','+',query)
+  url=paste0("http://eutils.ncbi.nlm.nih.gov/entrez/eutils/",
+             "esearch.fcgi?retmax=50000&db=pubmed&term=",query)
+  datafile = tempfile(pattern = "pub")
+  try(download.file(url, destfile = datafile, method = "internal", mode = "wb", quiet = TRUE), silent = TRUE)
+  xml <- xmlTreeParse(datafile, asTree = TRUE)
+  nid = xmlValue(xmlElementsByTagName(xmlRoot(xml), "Count")[[1]])
+  lid = xmlElementsByTagName(xmlRoot(xml), "IdList", recursive = TRUE)[[1]]
+  pid = paste(unlist(lapply(xmlElementsByTagName(lid, "Id"), xmlValue)),sep=":")
+  #print(c(hit_list[i],nid,pid))
+  output[i,"PubMed Number"]=nid
+  output[i,"Pubmed URL"]=paste0("http://www.ncbi.nlm.nih.gov/pubmed/?term=",query)
+}
+return(output)
+}
+
+#Test it out
+pubmedBatchQuery(c("Dmrt1","Sox9"),"Testis")
+```
+
+Use EdgeR to find differentially expressed genes.
+```{r EdgeR}
+group=factor(unlist(strsplit(colnames(TotalReads),"_"))[seq(from=1,to=2*length(colnames(TotalReads)),by=2)])
+group
+d=DGEList(counts=TotalReads, group=group, genes=new_annot)
+design <- model.matrix(~0+group)
+design
+d <- calcNormFactors(d)
+d$samples
+d <- estimateCommonDisp(d)
+d$common.dispersion
+d <- estimateTagwiseDisp(d)
+et <- exactTest(d,pair=c("WT","Null"))
+summary(de <- decideTestsDGE(et, p=0.05,adjust="BH"))
+tt<- topTags(et,n=20,sort.by = "PValue",adjust.method="BH")
+detags <- rownames(d)[as.logical(de)]
+plotSmear(et, de.tags=detags)
+abline(h = c(-2, 2), col = "blue")
+keep <- as.logical(de >= 1)
+up=d[keep,]
+upt<-exactTest(up,pair=c("WT","Null"))
+uptt<-topTags(upt,n=200, sort.by="logFC",adjust.method="BH")$table
+```
+
+Use EdgeR to build a GLM
+```{r GLM}
+D <- d
+D <- estimateGLMCommonDisp(d,design)
+#D <- estimateGLMTrendedDisp(d,design)
+D <- estimateGLMTagwiseDisp(d,design)
+plot(d$tag,D$tag,xlab="ordinary dispersion",ylab="GLM dispersion")
+D_fit <- glmFit(D,design)
+colnames(design)
+D6 <-c(1,-1)
+lrt.D6=glmLRT(D_fit,contrast=D6)
+head(lrt.D6$table)
+plotMDS(D)
+plotBCV(D)
+
+#PlotSmear: LogFC as a function of logCPM 
+summary(de <- decideTestsDGE(lrt.D6, p=0.05,adjust="BH"))
+de.lrt <- rownames(D)[as.logical(de)]
+plotSmear(lrt.D6, de.tags=de.lrt)
+
+D6tt<-topTags(lrt.D6,n=Inf,sort.by="none",adjust.method="BH")$table
+hist(D6tt$PValue,main="PValue Distribution")
+D6tt$qvalue<-qvalue(D6tt$PValue)$q
+#head(D6tt)
+
+#Volcano Plot - LogFC vs Pvalue
+plot(D6tt$logFC,-1*log10(D6tt$PValue),cex=0.5, pch=19,
+     col=ifelse(rownames(D6tt) %in% de.lrt, "red", "black"),
+     main="Dmrt6 Differential Expression")
+
+#Use one of the following selection criteria
+#D6tt<-D6tt[grep("Rhox",D6tt$mgi_symbol),]
+#D6tt<-D6tt[de != 0,]
+#D6tt<-D6tt[D6tt$ensembl_gene_id %in% dmrt6Anno$feature,]
+D6tt<-D6tt[D6tt$"PValue"<0.05,]
+#D6tt<-D6tt[abs(D6tt$logFC)>1,]
+```
+
+Use published Microarray data to look at the expression of these genes through spermatogenesis.
+```{r microrray}
+gset <- getGEO("GSE4193", destdir="/mnt/afp/micah/R/dmrt6", GSEMatrix =TRUE)
+sml <- c("A","A","B","B","P","P","R","R");
+#the March 2014 change to this GSE now returns a list of expression sets so I need the [[1]]
+ex <- exprs(gset[[1]])[ , order(sml)]
+ex["1427252_at",]
+ex["1460015_at",]
+gpl <- annotation(gset[[1]])
+platf <- getGEO(gpl, AnnotGPL=TRUE,destdir="/mnt/afp/micah/R/dmrt6")
+ncbifd <- data.frame(attr(dataTable(platf), "table"))
+colnames(ex)<-c("A_R1","A_R2","B_R1","B_R2","P_R1","P_R2","R_R1","R_R2")
+ex2<-merge(ex,ncbifd,by.x=0,by.y="ID")
+ex2<-subset(ex2,select=c("Row.names","A_R1","A_R2","B_R1",
+                         "B_R2","P_R1","P_R2","R_R1","R_R2","Gene.ID","Gene.symbol"))
+#NCBI Entry got update in March 2014, presumably to replace the log value with the raw value
+#ex2$A<-0.5*(2^ex2$A_R1+2^ex2$A_R2)
+#ex2$B<-0.5*(2^ex2$B_R1+2^ex2$B_R2)
+#ex2$P<-0.5*(2^ex2$P_R1+2^ex2$P_R2)
+#ex2$R<-0.5*(2^ex2$R_R1+2^ex2$R_R2)
+ex2$A<-0.5*(ex2$A_R1+ex2$A_R2)
+ex2$B<-0.5*(ex2$B_R1+ex2$B_R2)
+ex2$P<-0.5*(ex2$P_R1+ex2$P_R2)
+ex2$R<-0.5*(ex2$R_R1+ex2$R_R2)
+ex2$sum<-ex2$A+ex2$B
+ex2<-ex2[with(ex2,order(-sum)),]
+ex2$Gene.ID <- as.numeric(as.character(ex2$Gene.ID))
+ex2$Gene.symbol <- as.character(ex2$Gene.symbol)
+ex2[grep("Sohlh1",ex2$Gene.symbol),]
+nrow(ex2)
+sum(!(duplicated(ex2[,"Gene.ID"])) & ! is.na(ex2[,"Gene.ID"]))
+#head(ex2[is.na(ex2[,"Gene.ID"]),]$Gene.ID,n=50)
+#rm(ex3)
+
+ex3<-ex2[!(duplicated(ex2[,"Gene.ID"])) & ! is.na(ex2[,"Gene.ID"]),]
+head(ex3)
+ex3[grep("Dmrtb1",ex3$Gene.symbol),]
+rownames(ex3)<-ex3$Gene.ID
+ex3<-subset(ex3,select=c("Gene.symbol","A","B","P","R"))
+ex3[grep("Dmrtb1",ex3$Gene.symbol),]
+ex3[grep("Sohlh1",ex3$Gene.symbol),]
+#ncbifd[grep("Dmrtb1",ncbifd$Gene.symbol),]
+#Merge D6tt with Microarray data
+#head(D6tt)
+D6tt<-merge(D6tt,ex3,by.x="entrezgene",by.y=0,all.x=TRUE)
+#sum(duplicated(D6tt$ensembl_gene_id))
+#rownames(D6tt)<-D6tt$ensembl_gene_id
+#head(D6tt)
+#nrow(ex2)
+#ex2<-ex2[!is.na(ex2$Gene.ID),]
+#ex3<-ex2[1:nrow(ex2),]
+#rownames(ex3)<-ex3$Gene.ID
+
+D6tt[(grep("Dmrtb1",D6tt$mgi_symbol)),]
+D6tt[(grep("Dmrt1",D6tt$mgi_symbol)),]
+```
+
+Include Chip-Seq Data in D6tt
+```{r ChipSeq}
+#Run on Server
+#macs14 -t M8W_chip_dedup.bam -c M8W_input_dedup.bam -f BAM -s 25 \
+#             -g 1.87e9 -p 1e-05 --slocal 100 --llocal 1000 -n M8W_dedup_macs14_pe05
+#macs14 -t DM6_chip_dedup.bam -c DM6_input_dedup.bam -f BAM -s 25 \
+#             -g 1.87e9 -p 1e-05 --slocal 100 --llocal 1000 -n DM6_dedup_macs14_pe05
+
+#read in MACS Peaks and find overlaps with DMRT1 sites
+d1p05<-import("M8W_dedup_macs14_pe05_peaks.bed")
+d6p05<-import("DM6_dedup_macs14_pe05_peaks.bed")
+
+#find overlaps between 
+mp05overlap<-findOverlaps(d6p05,d1p05)
+
+grid.newpage()
+vennplot <- draw.pairwise.venn(length(d1p05),
+                               length(d6p05),
+                               length(mp05overlap),
+                               c("Dmrt1","Dmrt6"))
+grid.draw(vennplot)
+
+#Annotate d6macs peaks
+d6macs<-annotatePeakInBatch(as(d6p05,"RangedData"),AnnotationData=TSS.mouse.NCBIM37,output="both")
+d6macs<-addGeneIDs(d6macs,"org.Mm.eg.db",c("refseq","symbol"))
+d1macs<-annotatePeakInBatch(as(d1p05,"RangedData"),AnnotationData=TSS.mouse.NCBIM37,output="both")
+d1macs<-addGeneIDs(d1macs,"org.Mm.eg.db",c("refseq","symbol"))
+
+#Calculate # of Unique Features in D6
+length(unique(d6macs$feature))
+length(d6p05)
+length(unique(d1macs$feature))
+
+#Annotate Dmrt6 TopTable with Dmrt1 & Dmrt6 Chip Occupancy
+D6tt$d6macs <-D6tt$ensembl_gene_id %in% d6macs$feature
+D6tt$d1macs <-D6tt$ensembl_gene_id %in% d1macs$feature
+```
+
+```{r inVitroPwmSearch}
+invitro_site<-readDNAStringSet("/mnt/afp/murphy/profit/temp.fa")
+pfm_vitro<-consensusMatrix(invitro_site)
+pwm_vitro<-PWM(invitro_site)
+pfm.vitro<-new("pfm",mat=t(t(pfm_vitro[1:4,])*1/colSums(pfm_vitro[1:4,])),
+               name="In Vitro DMRT1 Site 2007")
+plotMotifLogo(pfm.vitro)
+
+
+findPWMinGR <- function(gr,pwm) {
+  c<-numeric()
+  for (i in 1:length(gr)) {
+  peak <- DNAString(Mmusculus[[as.character(seqnames(gr[i])@values)]],
+                    start=ranges(gr[i])@start,
+                    nchar=ranges(gr[i])@width)
+  site <-  matchPWM(pwm,peak,min.score="70%",with.score=TRUE)
+  #c[i]<-ifelse(length(site)>0,paste(round(elementMetadata(site)$score,4),collapse=";"),"0")
+  if(length(site)>0) {c[i]<-max(elementMetadata(site)$score)} else {c[i]<-0}
+  }
+  return(c)
+  }
+
+#test Genomic Range on Peaks of interest
+gr<-d6p05[c(1219,8236,8237,7547,8688)]
+findPWMinGR(gr,pwm_vitro)
+
+#Find DM domain motifs in full macs peak list
+d6p05DF<-as.data.frame(d6p05)
+system.time(d6p05DF$maxsite<-findPWMinGR(d6p05,pwm_vitro))
+
+#Calculate fraction of peaks that have DM domain binding motifs
+sum(d6p05DF$maxsite>0.7)/nrow(d6p05DF)
+#plot(d6p05DF$score,d6p05DF$maxsite,ylim=c(0.7,1),xlim=c(50,3500),cex=0.5, pch=19)
+
+#Calculate Correlation, excluding outliers
+d6p05_tempDF <- d6p05DF[d6p05DF$maxsite>0.7 & d6p05DF$score<2000,]
+plot(d6p05_tempDF$score,d6p05_tempDF$maxsite,cex=0.5, pch=19)
+cor(d6p05_tempDF$score,d6p05_tempDF$maxsite)
+
+#Cummulative Sum of sites as Pvalue decreases (MACS score increases)
+d6p05_tempDF <- d6p05DF[with(d6p05DF,order(-score)),]
+plot(cumsum(d6p05_tempDF$maxsite>0.7),cex=0.5, pch=19)
+abline(0,sum(d6p05DF$maxsite>0.7)/nrow(d6p05DF),col="red")
+
+```
+
+Count reads for Adult DMRT1 and DMRT6 ChipSeq data.
+```{r eval=FALSE}
+bamlst <- BamFileList(list.files("/mnt/afp/murphy/data/mm9", pattern=glob2rx("M8W_*_dedup.bam"),full=TRUE))
+d1counts<- summarizeOverlaps(d6p05, bamlst, mode="Union",singleEnd=TRUE, ignore.strand=TRUE)
+d1countsDF <-as.data.frame(assays(d1counts)$counts)
+
+bamlst <- BamFileList(list.files("/mnt/afp/murphy/data/mm9", pattern=glob2rx("DM6_*_dedup#.bam"),full=TRUE))
+d6counts <- summarizeOverlaps(d6p05, bamlst, mode="Union",singleEnd=TRUE, ignore.strand=TRUE)
+d6countsDF <-as.data.frame(assays(d6counts)$counts)
+save(d1countsDF,d6countsDF,file="chip_count_p05.rdata")
+```
+
+Analyze ChIP counts to identify Dmrt6 Specific Binding sites.
+```{r analyzeChipSeqCounts}
+load("chip_count_p05.rdata")
+
+#Normalize to Counts within regions of interest
+colnames(d1countsDF)<-c("d1c","d1i")
+
+#normalize to total counts in genomic intervals
+d1Enrichment<-log2(10^6*d1countsDF[,1]/sum(d1countsDF[,1]))
+colnames(d6countsDF)<-c("d6c","d6i")
+d6Enrichment<-log2(10^6*d6countsDF[,1]/sum(d6countsDF[,1]))
+#define logical varible to loosely define "dmrt6 specific Peaks"
+subset=d6Enrichment/d1Enrichment > 1.25
+
+plot(d1Enrichment,d6Enrichment,ylim=c(4,14),pch=19,
+     cex=0.5,col=ifelse(subset, "red", "black"))
+
+#calculate correlation coefficient for DMRT6 an DMRT1 binding intensity
+cor(d6Enrichment,d1Enrichment,method="spearman")
+
+#Output a Table
+#sum(d6Enrichment/d1Enrichment > 1.25)
+d6p05DF$d6cpm<-d6countsDF[,"d6c"]
+d6p05DF$d1cpm<-d1countsDF[,"d1c"]
+d6p05DF$d6Enrichment<-d6Enrichment
+d6p05DF$d1Enrichment<-d1Enrichment
+d6p05DF$ratio<-d6Enrichment/d1Enrichment
+
+d6macsDF<-as.data.frame(d6macs)
+d6macsDF$peak<-as.integer(d6macsDF$peak)
+d6macsDF<-d6macsDF[,c("peak","feature","symbol","insideFeature")]
+
+d6out<-merge(d6p05DF,d6macsDF,by.x=0,by.y="peak",all=T)
+d6out$row <- as.integer(d6out$Row.names)
+d6out<-d6out[with(d6out,order(row)),]
+d6out<-d6out[,c("feature","symbol","seqnames","start",
+                "end","width","score","maxsite","name",
+                "d6cpm","d1cpm","d6Enrichment","d1Enrichment","ratio")]
+colnames(d6out)<- c("Feature Name","Feature Symbol","Chromosome Name (mm9)","Peak Start (mm9)",
+                "Peak End (mm9)","Peak Width","MACS Score","Dmrt Site PWM Score"," MACS Peak Name",
+                "Dmrt6 CPM","Dmrt1 CPM","Dmrt6 Enrichment","Dmrt1 Enrichment","Enrichment Ratio")
+#d6out<-d6out[with(d6out,order(-score)),]
+#head(d6out)
+#d6out[grep("Kat6a",d6out$symbol),]
+write.csv(d6out,file="/mnt/afp/teng/data/Supplementary_Table_3.csv",quote=F,row.names=F)
+```
+
+Quick check for Enriched GO Terms in DMRT6 Specific Peaks
+```{r GO}
+#universe<-keys(org.Mm.eg.db,"SYMBOL")
+univ1<-unique(as.character(na.omit(d1macs$symbol)))
+univ6<-unique(as.character(na.omit(d6macs$symbol)))
+universe<-unique(c(univ1,univ6))
+length(universe)
+selected<-unique(as.character(na.omit(d6macs[subset,]$symbol)))
+length(selected)
+
+univmap <- select(org.Mm.eg.db, universe, "ENTREZID", "SYMBOL")
+genemap <- select(org.Mm.eg.db, selected, "ENTREZID", "SYMBOL")
+param<- new ("GOHyperGParams", geneIds = genemap, universeGeneIds=univmap, 
+             annotation="org.Mm.eg.db", ontology="BP",pvalueCutoff=0.01, 
+             conditional=FALSE,testDirection="over")
+
+hyp<-hyperGTest(param)
+tt<-head(summary(hyp),20)
+tt
+#barplot(-log10(tt$Pvalue), names.arg=paste(tt$Term, tt$GOBPID), las=2, ylab="-log10 p-value", col="Red")
+
+#try another test for all DMRT6 peaks
+selected<-univ6
+genemap <- select(org.Mm.eg.db, selected, "ENTREZID", "SYMBOL")
+param<- new ("GOHyperGParams", geneIds = genemap, universeGeneIds=univmap, 
+             annotation="org.Mm.eg.db", ontology="BP",pvalueCutoff=0.01, 
+             conditional=FALSE,testDirection="over")
+hyp<-hyperGTest(param)
+tt<-head(summary(hyp),20)
+tt
+#barplot(-log10(tt$Pvalue), names.arg=paste(tt$Term, tt$GOBPID), las=2, ylab="-log10 p-value", col="Red")
+```
+
+Check to see if there is a DMRT binding site under the DMRT6 Specific Peaks
+```{r MotifAnalysis}
+
+#Use a Chi-Squared test to see how unlikely the distribution of sites is
+d6ySy<-sum(d6p05DF[subset,"maxsite"]>0.7)
+d6ySn<-sum(subset)-d6ySy
+d6nSy<-sum(d6p05DF$maxsite>0.7)-d6ySy
+d6nSn<-nrow(d6p05DF)-d6nSy-d6ySn-d6ySy
+contable<-matrix(c(d6ySy,d6nSy,d6ySn,d6nSn),nr=2,nc=2)
+contable
+chisq.test(contable)
+
+#Compare In Vivo defined DMRT6 site with In vitro Site
+d6summits <- read.table("DM6_dedup_macs14_pe05_summits.bed", skip=0) 
+
+#Make 50bp windows around the summit
+d6summits <- RangedData(space=d6summits[,1], 
+                        IRanges(start=d6summits[,2]-25,
+                        end=d6summits[,3]+25), strand="*")
+
+#look for motifs under strong Dmrt6 peaks
+sum(d6p05DF$score>250)
+system.time(d6motifs<-GADEM(d6summits[d6p05DF$score>250,],
+                            genome=Mmusculus,weightType=1,
+                            maskR=1))
+length(d6motifs@motifList)
+consensus(d6motifs)
+dmrt6.pwm<-getPWM(d6motifs)
+pfm.dmrt6 <-new("pfm",mat=dmrt6.pwm[[1]],name="Dmrt6 Chip-Seq 2014")
+
+plotMotifLogoStack(DNAmotifAlignment(c(pfm.vitro,pfm.dmrt6)))
+
+#look for motifs in DMRT6 peaks that do not have an In vitro site
+#sum(d6p05DF$maxsite==0 & d6p05DF$score > 100)
+system.time(novel_motifs<-GADEM(d6summits[d6p05DF$maxsite==0 & d6p05DF$score > 100,],
+                            genome=Mmusculus,weightType=1,
+                            maskR=1))
+
+length(novel_motifs@motifList)
+consensus(novel_motifs)
+novel.pwm<-getPWM(novel_motifs)
+novel1.pfm <-new("pfm",mat=novel.pwm[[1]],name="Novel Site 1")
+plotMotifLogo(novel1.pfm)
+novel2.pfm <-new("pfm",mat=novel.pwm[[2]],name="Novel Site 2")
+plotMotifLogo(novel2.pfm)
+```
+
+Use Ingenuity's Ontology Categories to highlight spermatogenesis genes.  
+```{r IPA}
+#read in ingenuity csv's
+fls <- list.files("/mnt/afp/micah/From Vivian to Micah/csv/", pattern="csv$",full=TRUE)
+rm(humanEntrez)
+rm(mouseEntrez)
+humanEntrez=list()
+mouseEntrez=list()
+for(i in 1:length(fls)) {
+  print(fls[i])
+  temp<-read.csv(fls[i],skip=1,header=T,stringsAsFactors=F)
+  human<-temp$Entrez.Gene.ID.for.Human
+  human<-human[!is.na(human)]
+  human<-unlist(strsplit(as.character(human),"\\|"))
+  mouse<-temp$Entrez.Gene.ID.for.Mouse
+  mouse<-mouse[!is.na(mouse)]
+  mouse<-unlist(strsplit(as.character(mouse),"\\|"))
+  humanEntrez[[i]]<-human
+  mouseEntrez[[i]]<-mouse
+}
+names(humanEntrez)<-c("misc","dev","gamet","germ","gonad","meiosis","seminiferous","seminal","sperm","testis")
+names(mouseEntrez)<-c("misc","dev","gamet","germ","gonad","meiosis","seminiferous","seminal","sperm","testis")
+
+#Add Columns to master tt table
+#names(humanEntrez)
+for (i in 1:length(humanEntrez)) {
+  print(names(humanEntrez)[i])  
+  oldcolnames <- colnames(D6tt)
+  temp <- D6tt$ensembl_gene_id %in% humanEntrezToMouseEnsemble(humanEntrez[[i]])[,2] | D6tt$entrezgene %in% mouseEntrez[[i]]
+  D6tt <- cbind(D6tt,temp)
+  colnames(D6tt) <- c(oldcolnames,names(humanEntrez[i]))
+}
+```
+
+Make a table of "Genes of Interest" to validate by QPCR.
+```{r GeneListFiltering}
+#Create some Logical variables (decider1-3) to indicate whether the gene is "interesting"
+#Decider1 tells us that it is one of the ingenuity categories
+decider1 <- D6tt$misc | D6tt$dev | D6tt$gamet | D6tt$germ | D6tt$gonad | D6tt$meiosis | D6tt$seminiferous | D6tt$seminal | D6tt$sperm | D6tt$testis
+sum(decider1)
+
+#decider2 is just the p-value (may be redundant with GLM section above)
+decider2 <- D6tt$"PValue" <0.05 
+sum(decider2)
+#decider2 <- D6tt$"PValue" <0.05 & !is.na(D6tt$entrezgene) 
+
+#We want to only consider genes that are expressed in A's and B's or have unknown expression because they weren't on the microarray
+decider3 <- D6tt$A > 100 | D6tt$B > 100
+decider3[is.na(decider3)]<-TRUE
+sum(decider3)
+
+D6tt<-D6tt[,c("entrezgene","ensembl_gene_id","WT_R1","WT_R2","WT_R3","Null_R1","Null_R2","Null_R3","mgi_id",
+              "mgi_symbol","chromosome_name","start_position","end_position","strand","logFC","logCPM","LR","PValue",
+              "FDR","qvalue","Gene.symbol","A","B","P","R","d6macs","d1macs","misc","dev","gamet","germ",
+              "gonad","meiosis","seminiferous","seminal","sperm","testis")]
+
+colnames(D6tt)<-c("Entrezgene","Ensembl_gene_id","WT_R1","WT_R2","WT_R3","Null_R1","Null_R2","Null_R3","MGI_id",
+              "MGI_symbol","Chromosome_name(mm9)","Feature_start_position","Feature_end_position","Feature_strand",
+              "logFC","logCPM","Likelihood_Ratio","PValue","FDR","Qvalue","Microarray_Gene_symbol",
+              "Type_A_Spermatagonia Expression in Microarray","Type_B_Spermatagonia Expression in Microarray",
+              "Pachytene  Expression in Microarray","Round  Expression in Microarray","Dmrt6 ChIP-Seq Peak",
+              "Dmrt1 ChIP-Seq Peak","Misc Genes from Ingenuity that lacked Mouse EntrezIDs","Development of Genital Organ",
+              "Gamet*","Germ Cell","Gonad","Meiosis","Seminiferous","Seminal","Sperm*","Testis")
+
+
+
+#D6tt[D6tt$directTarget & D6tt$germIPA & D6tt$"PValue" <0.05,]
+D6ttGOI<-D6tt[decider1 & decider2 & decider3,]
+nrow(D6ttGOI)
+
+#run pubmedBatchQuery on interesting genes
+D6ttGOI<-cbind(D6ttGOI,pubmedBatchQuery(D6ttGOI$MGI_symbol,"Testis"))
+
+D6ttGOI <- D6ttGOI[with(D6ttGOI,order(PValue)),]
+#temp[,c("mgi_symbol","mgi_id","logFC","PValue","A","B","P","R","PubMed")]
+```
+
+Output the results
+```{r Output}
+D6tt<-D6tt[with(D6tt,order(-logFC)),]
+D6tt[grep("Dmrtb1",D6tt$mgi_symbol),]
+write.table(D6tt,"/mnt/afp/teng/data/Supplementary_Table_1.csv",quote=F,row.names=F,sep=",")
+write.table(D6ttGOI,"/mnt/afp/teng/data/Supplementary_Table_2.csv",quote=F,row.names=F,sep=",")
+sessionInfo()
+```
+
+
